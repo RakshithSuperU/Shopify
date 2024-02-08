@@ -1,0 +1,818 @@
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import pandas as pd
+import psycopg2
+import numpy as np
+import warnings
+warnings.filterwarnings("ignore")
+# conn = psycopg2.connect(
+#     host='shopify-merchant-dump.ccm9mnr5avgs.ap-south-1.rds.amazonaws.com',
+#     port='5432',
+#     user='toffee_coffee_roasters_69e3f806d0674953afe3d3fb2f724c7c',
+#     password='toffee_coffee_roasters_69e3f806d0674953afe3d3fb2f724c7c_password',
+#     database='toffee_coffee_roasters_69e3f806d0674953afe3d3fb2f724c7c_db'
+# )
+# conn = psycopg2.connect(
+#   host = "shopify-merchant-dump.ccm9mnr5avgs.ap-south-1.rds.amazonaws.com",
+#   user = "paakhi_9531e99d9a3e4b548b28f726fdea8d61",
+#   password = "paakhi_9531e99d9a3e4b548b28f726fdea8d61_password",
+#   database = "paakhi_9531e99d9a3e4b548b28f726fdea8d61_db",
+#   port = '5432'
+# )
+conn = psycopg2.connect(
+    host= "shopify-merchant-dump.ccm9mnr5avgs.ap-south-1.rds.amazonaws.com",
+    port='5432',
+    user='ss99deaae530b3756769a6c385b714569c',
+    password='ss99deaae530b3756769a6c385b714569c_password',
+    database='ss99deaae530b3756769a6c385b714569c_db'
+)
+
+#  AOV Conversion Analytics
+query_1 = """select
+created_at::date as created,
+id as id,
+customer_id as customer_id,
+contact_email as email,
+source_name as ordered_via,
+total_price as order_amount,
+CASE
+WHEN cancelled_at IS NOT NULL THEN 'Cancelled'
+ELSE 'Delivered'
+END as order_status
+from orders;"""
+
+query_2 = """select
+order_id,
+name as product_name,
+quantity from
+order_line_item;"""
+
+e=pd.read_sql(query_1,conn)
+e.columns = ["created", "order_id", "customer_id","email", "order_channel", "order_amount", "order_status"]
+e['created'] = pd.to_datetime(e['created'])
+
+f = pd.read_sql(query_2,conn)
+f.columns = ["order_id", "product_name", "quantity"]
+OrderSKUMap=f.groupby('order_id').agg(
+        SKUs=pd.NamedAgg(column='product_name', aggfunc= 'nunique'),
+        Quantity=pd.NamedAgg(column='quantity', aggfunc='sum'),
+    ).reset_index()
+
+e['OrderDate']=e['created'].dt.date
+e['OrderDate']=pd.to_datetime(e['OrderDate'])
+e['DeltaDaysinOrders']=(e.groupby('customer_id').OrderDate.shift() - e.OrderDate).dt.days.abs()
+e['DeltaOrderValues']=(e.groupby('customer_id').order_amount.shift() - e.order_amount)
+
+x1=e.groupby('customer_id').agg(
+        LastDate=pd.NamedAgg(column='OrderDate', aggfunc= 'max'),
+        FirstDate=pd.NamedAgg(column='OrderDate', aggfunc='min')
+    ).reset_index()
+
+
+e2=e.merge(x1[['customer_id','LastDate','FirstDate']], left_on='customer_id', right_on='customer_id')
+e2=e2.merge(OrderSKUMap, left_on='order_id', right_on='order_id', how='left')
+
+e2 = e2[e2['order_status'] != 'Cancelled']
+
+# e2=e2[e2['OrderDate']>='2023-01-01']
+e2['TrxnRank'] = e2.groupby('customer_id')['OrderDate'].rank(method='first')
+
+e2['WeekCount']=e2['OrderDate'].dt.strftime('%y-w%U')
+e2['MonthCount']=e2['OrderDate'].dt.strftime('%y-%b')
+
+e2 = e2.sort_values(by='created')
+def main_AOV(df, transx, transy,comp2_bin):
+
+    grouped_y_trxn = df[df['TrxnRank'] <= transy]
+
+    x_data = grouped_y_trxn[grouped_y_trxn['TrxnRank']<=transx]
+    x2 = x_data.groupby('customer_id').agg(
+        x_Order_Value=pd.NamedAgg(column='order_amount', aggfunc='sum')
+    ).reset_index()
+
+    x1 = grouped_y_trxn.groupby(['customer_id']).agg(
+        xDate=pd.NamedAgg(column='created', aggfunc= lambda x: x.nlargest(2).min()),
+        yDate=pd.NamedAgg(column='created', aggfunc= 'max'),
+        Order_Count=pd.NamedAgg(column='order_id', aggfunc='nunique'),
+        Total_Order_Value=pd.NamedAgg(column='order_amount', aggfunc='sum')
+    ).reset_index()
+
+    merged = pd.merge(x1, x2, on = 'customer_id', how = 'left')
+
+    merged['y_Order_Value'] = merged['Total_Order_Value'] - merged['x_Order_Value']
+    merged['x_Order_Value'] = merged['x_Order_Value'].fillna(0)
+
+    merged=merged.sort_values(by='xDate')
+
+    merged['AOV_Bins']=merged['x_Order_Value'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['Bin1', 'Bin2', 'Bin3', 'Bin4','Bin5','Bin6','Bin7','Bin8','Bin9','Bin10']))
+    merged['Converted'] = 0
+    merged.loc[merged['Order_Count']>transx,'Converted'] = 1
+    merged['xDate'] = pd.to_datetime(merged['xDate'])
+
+    convert_df = merged.groupby('AOV_Bins').agg(
+        Acquired_Pool=pd.NamedAgg(column='customer_id', aggfunc= 'nunique'),
+        Repeat_Pool=pd.NamedAgg(column='Converted', aggfunc='sum'),
+        Total_Order_Value=pd.NamedAgg(column='Total_Order_Value', aggfunc='sum'),
+        AOV_of_the_bin=pd.NamedAgg(column='x_Order_Value', aggfunc='mean')
+    ).reset_index()
+
+    convert_df['Conversion_Rate'] = convert_df['Repeat_Pool']/convert_df['Acquired_Pool']
+
+    comp1=convert_df.copy()
+
+    comp1=comp1.astype({'Acquired_Pool': int, 'Repeat_Pool': int}).round({'Total_Order_Value':2, 'AOV_of_the_bin':2, 'Conversion_Rate': 3})
+    comp1['Conversion_Rate'] = comp1['Conversion_Rate']*100
+
+    comp2=merged[merged['AOV_Bins']==comp2_bin][['customer_id','x_Order_Value']]
+    comp2=comp2.rename(columns={'x_Order_Value':'Order_Value'})
+    comp2=comp2.set_index('customer_id')
+    comp2.index.name = None
+    comp2.columns.name = "Customer_ID"
+    comp2['Order_Value'] = comp2['Order_Value'].apply(lambda x: "{:.2f}".format(x))
+
+    convert_df_sort = convert_df.sort_values(by='Conversion_Rate', ascending=False)
+    if(transx==1):
+        bins_to_return = convert_df_sort['AOV_Bins'].head(3).tolist()
+    elif(transx==2):
+        bins_to_return = convert_df_sort['AOV_Bins'].head(3).tolist()
+    else:
+        bins_to_return = convert_df_sort['AOV_Bins'].head(7).tolist()
+
+    if (transx==1):
+        comp1 = comp1.rename(columns={'Repeat_Pool':'Second_Transaction_Pool'})
+    elif (transx==2):
+        comp1 = comp1.rename(columns={'Acquired_Pool':'Second_Transaction_Pool','Repeat_Pool':'Third_Transaction_Pool'})
+    elif (transx==3):
+        comp1 = comp1.rename(columns={'Acquired_Pool':'Third_Transaction_Pool','Repeat_Pool':'Fourth_Transaction_Pool'})
+
+    return comp1,bins_to_return,comp2
+conv_analytics_new_to_repeat_AOV, one_to_two_trxn_AOV_bin, conv_analytics_new_to_repeat_AOV_2 = main_AOV(e2,1,2,'Bin1')
+conv_analytics_two_to_three_AOV, two_to_three_trxn_AOV_bin, conv_analytics_two_to_three_AOV_2 = main_AOV(e2,2,3,'Bin2')
+conv_analytics_three_to_four_AOV, three_to_four_trxn_AOV_bin, conv_analytics_three_to_four_AOV_2 = main_AOV(e2,3,4,'Bin3')
+# Conversion Analytics based on AOV:
+# NEW_REPEAT:
+# Component 1: conv_analytics_new_to_repeat_AOV
+# Component 2: conv_analytics_new_to_repeat_AOV_2
+
+# 2_3:
+# Component 1: conv_analytics_two_to_three_AOV
+# Component 2: conv_analytics_two_to_three_AOV_2
+
+# 3_4:
+# Component 1: conv_analytics_three_to_four_AOV
+# Component 2: conv_analytics_three_to_four_AOV_2
+
+
+
+# Pincode Conversion Analytics
+query_3 = '''
+SELECT order_id AS order_id,
+zip AS pincode,
+city as city
+FROM order_billing_address;
+'''
+x = pd.read_sql(query_3, conn)
+# x = x[x['pincode'].str.len()==6]
+# x = x[x['pincode']!='695 01']
+# x = x[x['pincode']!='609.60']
+# x = x[x['pincode']!= 'V1M3S8']
+
+query_4 = '''select
+    created_at::date as OrderDate,
+    id as order_id,
+    customer_id as customer_id,
+    CASE
+        WHEN cancelled_at IS NOT NULL THEN 'Cancelled'
+        ELSE 'Delivered'
+    END as order_status
+    from orders;'''
+
+query_5 = '''select
+    name as product_name,
+    order_id,
+    product_id,
+    quantity,
+    price
+    from order_line_item;'''
+
+a=pd.read_sql(query_4,conn)
+b = pd.read_sql(query_5,conn)
+
+a['orderdate'] = pd.to_datetime(a['orderdate'])
+# a = a[a['orderdate']>='2023-09-01']
+
+a = a[a['order_status']=='Delivered']
+a.drop('order_status',axis=1,inplace=True)
+a['TrxnRank'] = a.groupby(['customer_id'])['orderdate'].rank(method='first')
+
+merged_new = pd.merge(a,b,on='order_id')
+final_pincode = pd.merge(merged_new,x,on='order_id',how='right')
+final_pincode.dropna(inplace=True)
+def main_pincode(df, transx, transy,comp2_bin):
+    trans_x = df[df['TrxnRank']==transx]
+    trans_y_users = trans_x['customer_id'].unique()
+    trans_y = df[(df['TrxnRank']==transy) & (df['customer_id'].isin(trans_y_users))]
+
+    xuser=trans_x.groupby(['pincode','customer_id']).agg(
+        x_user=pd.NamedAgg(column='customer_id', aggfunc='nunique'),
+    )
+    xuser_count=xuser.groupby('pincode').agg(
+        x_trxn_pool=pd.NamedAgg(column='x_user', aggfunc='sum'),
+    ).reset_index()
+
+    yuser=trans_y.groupby(['pincode','customer_id']).agg(
+        y_user=pd.NamedAgg(column='customer_id', aggfunc='nunique'),
+    )
+    yuser_count=yuser.groupby('pincode').agg(
+        y_trxn_pool=pd.NamedAgg(column='y_user', aggfunc='sum'),
+    ).reset_index()
+
+    m=pd.merge(xuser, yuser, left_index=True, right_index=True, how='inner').reset_index()
+    yuser_count=m.groupby('pincode').agg(
+        y_trxn_pool=pd.NamedAgg(column='y_user', aggfunc='sum')
+    ).reset_index()
+
+    main_grouped_for_pincode = pd.merge(xuser_count, yuser_count, on='pincode', how='left').fillna(0)
+    main_grouped_for_pincode['Conversion_Rate']=main_grouped_for_pincode['y_trxn_pool']/main_grouped_for_pincode['x_trxn_pool']
+
+    main_grouped_for_pincode['Bins']=main_grouped_for_pincode['Conversion_Rate'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 5, labels = ['Bin1', 'Bin2', 'Bin3', 'Bin4', 'Bin5']))
+
+    df_city=df[['pincode','city']]
+    main_grouped_for_pincode=pd.merge(main_grouped_for_pincode,df_city,on='pincode',how='left')
+
+    convert_df = main_grouped_for_pincode.groupby('Bins').agg(
+        Acquired_Pool=pd.NamedAgg(column='x_trxn_pool', aggfunc= 'sum'),
+        Repeat_Pool=pd.NamedAgg(column='y_trxn_pool', aggfunc='sum'),
+        Conversion_Rate=pd.NamedAgg(column='Conversion_Rate', aggfunc='mean'),
+        no_of_pincodes=pd.NamedAgg(column='pincode', aggfunc='nunique')
+    ).reset_index()
+
+    comp1 = convert_df
+    comp1 = comp1.rename(columns={'no_of_pincodes':'Number of Pincodes in the Bin'})
+
+    comp2=main_grouped_for_pincode[main_grouped_for_pincode['Bins']==comp2_bin]
+    comp2=comp2.rename(columns={'x_trxn_pool':'Acquired_Pool', 'y_trxn_pool':'Repeat_Pool', 'pincode':'Pincode', 'city':'City'})
+    comp2=comp2.drop(columns='Bins')
+
+    comp1 = comp1.astype({'Acquired_Pool': int, 'Repeat_Pool': int, 'Number of Pincodes in the Bin': int}).round({'Conversion_Rate': 3})
+    comp1['Conversion_Rate'] = comp1['Conversion_Rate']*100
+
+    comp2 = comp2.astype({'Acquired_Pool': int, 'Repeat_Pool': int}).round({'Conversion_Rate': 3})
+    comp2['Conversion_Rate'] = comp2['Conversion_Rate']*100
+
+    if (transx==1):
+        comp1 = comp1.rename(columns={'Repeat_Pool':'Second_Transaction_Pool'})
+        comp2 = comp2.rename(columns={'Repeat_Pool':'Second_Transaction_Pool'})
+    elif (transx==2):
+        comp1 = comp1.rename(columns={'Acquired_Pool':'Second_Transaction_Pool','Repeat_Pool':'Third_Transaction_Pool'})
+        comp2 = comp2.rename(columns={'Acquired_Pool':'Second_Transaction_Pool','Repeat_Pool':'Third_Transaction_Pool'})
+    elif (transx==3):
+        comp1 = comp1.rename(columns={'Acquired_Pool':'Third_Transaction_Pool','Repeat_Pool':'Fourth_Transaction_Pool'})
+        comp2 = comp2.rename(columns={'Acquired_Pool':'Third_Transaction_Pool','Repeat_Pool':'Fourth_Transaction_Pool'})
+
+    if ((transx == 1) & (transx==2)):
+        pot_pincode = main_grouped_for_pincode[(main_grouped_for_pincode['Bins']=='Bin5')]['pincode'].to_list()
+    else:
+        bins_to_include = ['Bin2','Bin3', 'Bin4', 'Bin5']
+        pot_pincode = main_grouped_for_pincode[main_grouped_for_pincode['Bins'].isin(bins_to_include)]['pincode'].to_list()
+
+    return comp1, pot_pincode, comp2.drop_duplicates()
+conv_analytics_new_to_repeat_pincode, one_to_two_trxn_pincode, conv_analytics_new_to_repeat_pincode_2 = main_pincode(final_pincode,1,2,'Bin4')
+conv_analytics_two_to_three_pincode, two_to_three_trxn_pincode, conv_analytics_two_to_three_pincode_2 = main_pincode(final_pincode,2,3,'Bin4')
+conv_analytics_three_to_four_pincode, three_to_four_trxn_pincode, conv_analytics_three_to_four_pincode_2 = main_pincode(final_pincode,3,4,'Bin4')
+# Conversion Analytics based on Pincode:
+# NEW_REPEAT:
+# Component 1: conv_analytics_new_to_repeat_pincode
+# Component 2: conv_analytics_new_to_repeat_pincode_2
+
+# 2_3:
+# Component 1: conv_analytics_two_to_three_pincode
+# Component 2: conv_analytics_two_to_three_pincode_2
+
+# 3_4:
+# Component 1: conv_analytics_three_to_four_pincode
+# Component 2: conv_analytics_three_to_four_pincode_2
+
+
+
+
+# SKU Conversion Analytics
+query_6 = '''select
+    created_at::date as OrderDate,
+    id as order_id,
+    customer_id as customer_id,
+    CASE
+        WHEN cancelled_at IS NOT NULL THEN 'Cancelled'
+        ELSE 'Delivered'
+    END as order_status
+    from orders;'''
+
+query_7 = '''select
+    name as product_name,
+    order_id,
+    product_id,
+    quantity,
+    price,
+    variant_title as variant
+    from order_line_item;'''
+
+query_8 = '''select
+    id as product_id,
+    title as product_title,
+    product_type as product_category,
+    handle,
+    tags
+    from products;'''
+ee = pd.read_sql(query_6, conn)
+ff = pd.read_sql(query_7, conn)
+gg = pd.read_sql(query_8, conn)
+
+ee = ee[ee['order_status']=='Delivered']
+ee.drop('order_status',axis=1,inplace=True)
+
+ee_sorted = ee.sort_values(by=['customer_id', 'orderdate', 'order_id'])
+merged_df = pd.merge(ff, ee, on='order_id')
+
+merged_df.dropna(inplace=True)
+
+merged_df['Transaction_Rank'] = merged_df.groupby(['customer_id', 'product_name'])['orderdate'].rank(method='first')
+
+final = pd.merge(merged_df, gg, on='product_id')
+
+final['Total Order Value'] = final['quantity'] * final['price']
+def main_x(final, transactionx, transactiony, parameter):
+
+    final1 = final.copy()
+
+    if parameter == "tags":
+        final_tags = final1.copy()
+        final_tags['tags'] = final_tags['tags'].str.split(',')
+        final_tags = final_tags.explode('tags', ignore_index=True)
+        final1 = final_tags
+    else:
+        pass
+
+    trans_x = final1[final1['Transaction_Rank']==transactionx]
+    trans_y = final1[(final1['Transaction_Rank']==transactiony)]
+
+    xuser_count = trans_x.groupby(parameter).agg(
+        x_trxn_pool = pd.NamedAgg(column = "customer_id", aggfunc = 'nunique')
+    ).reset_index()
+
+    yuser_count = trans_y.groupby(parameter).agg(
+        y_trxn_pool = pd.NamedAgg(column = "customer_id", aggfunc = 'nunique')
+    ).reset_index()
+
+    main_grouped_for_title = pd.merge(xuser_count, yuser_count, on=parameter, how='left')
+    main_grouped_for_title['y_trxn_pool'].fillna(0, inplace=True)
+
+    result = main_grouped_for_title.copy()
+
+    result['Conversion_Rate_x_to_y'] = result['y_trxn_pool']/result['x_trxn_pool']
+    result['Conversion_Rate_x_to_y'].fillna(0, inplace= True)
+    result['Cart_Penetration_for_x_transaction'] = result['x_trxn_pool']/(result['x_trxn_pool'].sum())
+    result['Cart_Penetration_for_y_transaction'] = result['y_trxn_pool']/(result['y_trxn_pool'].sum())
+
+    result1 = result.copy()
+    result2 = result.copy()
+    result1 = result1.sort_values(by='Conversion_Rate_x_to_y', ascending=False)
+    result2 = result2.sort_values(by='Cart_Penetration_for_x_transaction', ascending=False)
+
+    result1['Mix']= result1['Conversion_Rate_x_to_y']*100/result1['Conversion_Rate_x_to_y'].sum()
+    result1['CumuSum']= result1['Mix'].cumsum()
+    result1['Conversion Rate Bin']=0
+    if(transactionx==1):
+        result1.loc[result1['CumuSum']>=60,"Conversion Rate Bin"]='HighConversion'
+        result1.loc[(result1['CumuSum']<60),"Conversion Rate Bin"]='LowConversion'
+    elif(transactionx==2):
+        result1.loc[result1['CumuSum']>=95,"Conversion Rate Bin"]='HighConversion'
+        result1.loc[(result1['CumuSum']<95),"Conversion Rate Bin"]='LowConversion'
+    else:
+        result1.loc[result1['CumuSum']>=30,"Conversion Rate Bin"]='HighConversion'
+        result1.loc[(result1['CumuSum']<30) ,"Conversion Rate Bin"]='LowConversion'
+    result2['Mix']= result2['Cart_Penetration_for_x_transaction']*100/result2['Cart_Penetration_for_x_transaction'].sum()
+    result2['CumuSum']= result2['Mix'].cumsum()
+    result2['Cart Penetration Bin']=0
+    result2.loc[result2['CumuSum']<=75,"Cart Penetration Bin"]='HighCartPenetration'
+    result2.loc[(result2['CumuSum']>75) & (result2['CumuSum']<=101),"Cart Penetration Bin"]='LowCartPenetration'
+
+    result2 = result2[[parameter,'Cart Penetration Bin']]
+    final_merged_on_title_x_to_y = pd.merge(result1, result2, on=parameter)
+
+    #-------------------------------------------------------------------------------------------------------------------------------
+
+    final_merged_on_title_x_to_y = final_merged_on_title_x_to_y[final_merged_on_title_x_to_y['Conversion Rate Bin'] != 0]
+
+    #-------------------------------------------------------------------------------------------------------------------------------
+
+    final_merged_on_title_x_to_y['Bin'] = final_merged_on_title_x_to_y['Conversion Rate Bin'] + '_' + final_merged_on_title_x_to_y['Cart Penetration Bin']
+    # final_merged_on_title_x_to_y.drop(['Conversion Rate Bin','Cart Penetration Bin'], axis=1, inplace= True)
+
+    #-------------------------------------------------------------------------------------------------------------------------------
+
+    merged_title_on_bin = final_merged_on_title_x_to_y.groupby('Bin').agg({
+        parameter: 'nunique'
+    }).reset_index()
+
+    #-------------------------------------------------------------------------------------------------------------------------------
+
+    x = final_merged_on_title_x_to_y.columns
+    y = []
+
+    num_dict = {
+        1: "Acquired",
+        2: "Second",
+        3: "Third",
+        4: "Fourth"
+    }
+
+    for i in x:
+        if "x_" in i:
+            i = i.replace("x_", f"{str(num_dict[transactionx])}_")
+        if "_x" in i:
+            i = i.replace("_x", f"_{str(num_dict[transactionx])}")
+        if "y_" in i:
+            i = i.replace("y_", f"{str(num_dict[transactiony])}_")
+        if "_y" in i:
+            i = i.replace("_y", f"_{str(num_dict[transactiony])}")
+        y.append(i)
+    final_merged_on_title_x_to_y.columns = y
+
+    return final_merged_on_title_x_to_y, result1[[parameter, "Conversion Rate Bin"]], final_merged_on_title_x_to_y[[parameter, f"Conversion_Rate_{num_dict[transactionx]}_to_{num_dict[transactiony]}", f"Cart_Penetration_for_{num_dict[transactionx]}_transaction", f"Cart_Penetration_for_{num_dict[transactiony]}_transaction"]]
+
+prdt_page, input, prdt_page_2  = main_x(final, 1, 2, "product_name")
+one_to_two_trxn_prod = input[input['Conversion Rate Bin']=='HighConversion']['product_name'].to_list()
+
+try:
+    prdt_page1, input2,prdt_page1_2 = main_x(final, 2 ,3, 'product_name')
+    two_to_three_trxn_prod = input2[input2['Conversion Rate Bin']=='HighConversion']['product_name'].to_list()
+except:
+    two_to_three_trxn_prod=[]
+
+try:
+    prdt_page2,input3,prdt_page2_2 = main_x(final, 3, 4, 'product_name')
+    three_to_four_trxn_prod = input3[input3['Conversion Rate Bin']=='HighConversion']['product_name'].to_list()
+except:
+    three_to_four_trxn_prod=[]
+
+# def component1(final, transactionx, transactiony, parameter):
+#     num_dict = {
+#         1: "Acquired",
+#         2: "Second",
+#         3: "Third",
+#         4: "Fourth"
+#     }
+#     prdt_page_x, input, prdt_page_x_2 = main_x(final, transactionx, transactiony, parameter)
+#     component1_dump = pd.merge(final, prdt_page_x, on='product_name', how='left')
+#     acq = f"{num_dict[transactionx]}_trxn_pool"
+#     repeat = f"{num_dict[transactiony]}_trxn_pool"
+#     conversion = f"Conversion_Rate_{num_dict[transactionx]}_to_{num_dict[transactiony]}"
+#     cart_pen_1 = f"Cart_Penetration_for_{num_dict[transactionx]}_transaction"
+#     cart_pen_2 = f"Cart_Penetration_for_{num_dict[transactiony]}_transaction"
+#     component1_to_show = component1_dump.groupby("Bin").agg(
+#         Product_Counts = pd.NamedAgg(column = 'product_name', aggfunc = 'nunique'),
+#         Quantity = pd.NamedAgg(column = 'quantity', aggfunc = 'sum'),
+#         Acquired_Pool = pd.NamedAgg(column = acq, aggfunc = 'sum'),
+#         Repeat_Pool = pd.NamedAgg(column = repeat, aggfunc = 'sum'),
+#         Total_Order_Value = pd.NamedAgg(column = "Total Order Value", aggfunc = 'sum'),
+#         rename1 = pd.NamedAgg(column = conversion, aggfunc = 'mean'),
+#         rename2 = pd.NamedAgg(column = cart_pen_1, aggfunc = 'mean'),
+#         rename3 = pd.NamedAgg(column = cart_pen_2, aggfunc = 'mean')).reset_index()
+#     component1_to_show["Acquired_Pool"] = component1_to_show["Acquired_Pool"].astype("int")
+#     component1_to_show["Repeat_Pool"] = component1_to_show["Repeat_Pool"].astype("int")
+#     component1_to_show['Total_Order_Value'] = component1_to_show['Total_Order_Value'].apply(lambda x: "{:.2f}".format(x))
+#     component1_to_show["rename1"] = round(component1_to_show["rename1"]*100,1)
+#     component1_to_show.rename(columns = {"rename1": conversion, "rename2": cart_pen_1, "rename3":cart_pen_2, 'Acquired_Pool':acq, 'Repeat_Pool':repeat}, inplace = True)
+#     component1_to_show.set_index("Bin", inplace = True)
+
+#     p=[]
+#     comp1_columns=component1_to_show.columns
+#     for i in comp1_columns:
+#         if 'trxn' in i:
+#             i = i.replace("trxn", "Transaction")
+#         if 'transaction' in i:
+#             i = i.replace('transaction', 'Transaction')
+#         if 'pool' in i:
+#             i = i.replace('pool', 'Pool')
+
+#         p.append(i)
+
+#     component1_to_show.columns=p
+#     component1_to_show.columns.name = "Bins"
+#     component1_to_show.index.name = None
+
+#     return component1_to_show #, component1_dump
+# component_1_to_show = component1(final, 2, 3, 'product_name')
+
+# def component2(parameter, Bin):
+#     df = prdt_page[prdt_page["Bin"] == Bin]
+#     df.set_index(parameter, inplace = True)
+#     df.drop(columns = ["Mix", "CumuSum"], inplace = True)
+
+#     q=[]
+#     df_columns=df.columns
+#     for i in df_columns:
+#         if 'trxn' in i:
+#             i = i.replace("trxn", "Transaction")
+#         if 'transaction' in i:
+#             i = i.replace('transaction', 'Transaction')
+#         if 'pool' in i:
+#             i = i.replace('pool', 'Pool')
+
+#         q.append(i)
+#     df.columns=q
+
+#     return df
+#Component 2
+# component2('product_name', "LowConversion_LowCartPenetration")
+
+
+
+
+# Transaction Dump
+query_9='''select customer_id as user_id, first_name, last_name, phone as Phone_Number, accepts_marketing as Accepts_Marketing, email_marketing_consent_state as Email_Marketing_Consent_State, sms_marketing_consent_state as SMS_Marketing_Consent_State from customers;'''
+hhh = pd.read_sql(query_9, conn)
+hhh.loc[hhh['first_name'].isna(), 'Customer_Name']=hhh['last_name']
+hhh.loc[~hhh['first_name'].isna(), 'Customer_Name']=hhh['first_name']+' '+hhh['last_name']
+hhh=hhh.drop(columns=['first_name','last_name'])
+
+t = pd.merge(e2,final_pincode,on='order_id',how='left')
+t = t[(t['customer_id_x'] == t['customer_id_y']) & (t['TrxnRank_x'] == t['TrxnRank_y'])]
+t = t[['created', 'order_amount', 'customer_id_x', 'Quantity', 'TrxnRank_x', 'product_id', 'product_name', 'pincode','city','order_id','email']]
+t.rename(columns = {'customer_id_x':'customer_id', 'TrxnRank_x':'TrxnRank'}, inplace = True)
+t.dropna(inplace=True)
+
+t = t[t['TrxnRank']<=4.0]
+t.groupby('order_id').agg(
+    AOV=pd.NamedAgg(column='order_amount', aggfunc='sum')
+)
+dump_AOV = t.groupby(['customer_id','TrxnRank']).agg(
+    AOV=pd.NamedAgg(column='order_amount', aggfunc='sum')
+).reset_index()
+
+dump=pd.merge(dump_AOV, t, on =['customer_id','TrxnRank'], how='left').dropna()
+
+dump['Bins1']=dump[dump['TrxnRank']==1.0]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['B1', 'B2', 'B3', 'B4','B5','B6','B7','B8','B9','B10']))
+dump['Bins2']=dump[dump['TrxnRank']==2.0]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['B1', 'B2', 'B3', 'B4','B5','B6','B7','B8','B9','B10']))
+dump['Bins3']=dump[dump['TrxnRank']==3.0]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['B1', 'B2', 'B3', 'B4','B5','B6','B7','B8','B9','B10']))
+t=dump.copy()
+t['one_to_two_pin']=0
+t['two_to_three_pin']=0
+t['three_to_four_pin']=0
+t.loc[(t['pincode'].isin(one_to_two_trxn_pincode)) & (t['TrxnRank']==1.0),'one_to_two_pin'] = 1
+t.loc[(t['pincode'].isin(two_to_three_trxn_pincode)) & (t['TrxnRank']==2.0),'two_to_three_pin'] = 1
+t.loc[(t['pincode'].isin(three_to_four_trxn_pincode)) & (t['TrxnRank']==3.0),'three_to_four_pin'] = 1
+t['one_to_two_bin']=0
+t['two_to_three_bin']=0
+t['three_to_four_bin']=0
+t.loc[(t['Bins1'].isin(one_to_two_trxn_AOV_bin)) & (t['TrxnRank']==1.0),'one_to_two_bin'] = 1
+t.loc[(t['Bins2'].isin(two_to_three_trxn_AOV_bin)) & (t['TrxnRank']==2.0),'two_to_three_bin'] = 1
+t.loc[(t['Bins3'].isin(three_to_four_trxn_AOV_bin)) & (t['TrxnRank']==3.0),'three_to_four_bin'] = 1
+t['one_to_two_prod']=0
+t['two_to_three_prod']=0
+t['three_to_four_prod']=0
+t.loc[(t['product_name'].isin(one_to_two_trxn_prod)) & (t['TrxnRank']==1.0),'one_to_two_prod'] = 1
+t.loc[(t['product_name'].isin(two_to_three_trxn_prod)) & (t['TrxnRank']==2.0),'two_to_three_prod'] = 1
+t.loc[(t['product_name'].isin(three_to_four_trxn_prod)) & (t['TrxnRank']==3.0),'three_to_four_prod'] = 1
+t_upd = t.groupby('customer_id').agg(
+    order_count=pd.NamedAgg(column='order_id', aggfunc='nunique')
+).reset_index()
+
+t=pd.merge(t,t_upd, on='customer_id',how='left')
+
+t_x=t[['customer_id','email','city','TrxnRank']]
+t_x=t_x.rename(columns={'email':'Customer email ID', 'city':'City'})
+t_x_1=t_x[t_x['TrxnRank']==1]
+t_x_2=t_x[t_x['TrxnRank']==2]
+t_x_3=t_x[t_x['TrxnRank']==3]
+
+
+# Conversion, Potential, DropOff Counts
+main_dump = t.groupby('customer_id').agg(
+    FirstDate=pd.NamedAgg(column='created', aggfunc='min'),
+    LastDate=pd.NamedAgg(column='created', aggfunc='max'),
+    AOV=pd.NamedAgg(column='order_amount', aggfunc='sum'),
+    orderCount=pd.NamedAgg(column='order_id', aggfunc='nunique'),
+    List_of_Pincodes=pd.NamedAgg(column='pincode', aggfunc=lambda x: x.unique()),
+    productName=pd.NamedAgg(column='product_name', aggfunc=lambda x: x.unique())
+).reset_index()
+
+main_dump["PinCode_Tag_1_to_2"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 5] if (x) in one_to_two_trxn_pincode])
+
+
+main_dump["prod_name_1_to_2"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 6] if (x) in one_to_two_trxn_prod])
+
+main_dump['AOV_bin_1_to_2'] = 0
+main_dump.loc[main_dump['orderCount']==1,'AOV_bin_1_to_2']= main_dump.loc[main_dump['orderCount']==1]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['B1','B2','B3','B4','B5','B6','B7','B8','B9','B10']))#.astype('int64')
+main_dump["PinCode_Tag_2_to_3"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 5] if (x) in two_to_three_trxn_pincode])
+
+main_dump["prod_name_2_to_3"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 6] if (x) in two_to_three_trxn_prod])
+
+main_dump['AOV_bin_2_to_3'] = 0
+main_dump.loc[main_dump['orderCount']==2,'AOV_bin_2_to_3']= main_dump.loc[main_dump['orderCount']==2]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['B1','B2','B3','B4','B5','B6','B7','B8','B9','B10']))#.astype('int64')
+main_dump["PinCode_Tag_3_to_4"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 5] if (x) in three_to_four_trxn_pincode])
+
+main_dump["prod_name_3_to_4"] = 0
+for i in range (len(main_dump)):
+    main_dump.iloc[i, -1] = len([x for x in main_dump.iloc[i, 6] if (x) in three_to_four_trxn_prod])
+
+main_dump['AOV_bin_3_to_4'] = 0
+main_dump.loc[main_dump['orderCount']==3,'AOV_bin_3_to_4']= main_dump.loc[main_dump['orderCount']==3]['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = 10, labels = ['Bin1','Bin2','Bin3','Bin4','Bin5','Bin6','Bin7','Bin8','Bin9','Bin10']))#.astype('int64')
+main_dump['AOV_check_1']=0
+main_dump.loc[((main_dump['orderCount']==1) & (main_dump['AOV_bin_1_to_2'].isin(one_to_two_trxn_AOV_bin))), 'AOV_check_1']=1
+main_dump['AOV_check_2']=0
+main_dump.loc[((main_dump['orderCount']==2) & (main_dump['AOV_bin_2_to_3'].isin(two_to_three_trxn_AOV_bin))), 'AOV_check_2']=1
+main_dump['AOV_check_3']=0
+main_dump.loc[((main_dump['orderCount']==3) & (main_dump['AOV_bin_3_to_4'].isin(three_to_four_trxn_AOV_bin))), 'AOV_check_3']=1
+main_dump['FirstDate'] = pd.to_datetime(main_dump['FirstDate'])
+# three_months_ago = datetime.now() - timedelta(days=3 * 30)
+# three_months_ago_date = three_months_ago.date()
+# three_months_ago_date=pd.to_datetime(three_months_ago_date)
+
+main_dump['Potential_1_to_2'] = 0
+main_dump.loc[((main_dump['orderCount']==1)  & ((main_dump['PinCode_Tag_1_to_2']>1) | (main_dump['AOV_check_1']==1) | (main_dump['prod_name_1_to_2']>0))),'Potential_1_to_2']= 1
+main_dump['Potential_2_to_3'] = 0
+main_dump.loc[((main_dump['orderCount']==2)  & ((main_dump['PinCode_Tag_2_to_3']>1) | (main_dump['AOV_check_2']==1) | (main_dump['prod_name_2_to_3']>0))),'Potential_2_to_3']= 1
+main_dump['Potential_3_to_4'] = 0
+main_dump.loc[((main_dump['orderCount']==3)  & ((main_dump['PinCode_Tag_3_to_4']>1) | (main_dump['AOV_check_3']==1))),'Potential_3_to_4']= 1
+main_dump['Convert_1_to_2'] = 0
+main_dump['Convert_2_to_3'] = 0
+main_dump['Convert_3_to_4'] = 0
+
+main_dump.loc[(main_dump['orderCount']==2), 'Convert_1_to_2']= 1
+main_dump.loc[(main_dump['orderCount']==3), 'Convert_2_to_3']= 1
+main_dump.loc[(main_dump['orderCount']==4), 'Convert_3_to_4']= 1
+main_dump['WeekCount'] = main_dump['FirstDate'].dt.strftime('%Y-w%U')
+main_dump['Inactive'] = 0
+main_dump.loc[(main_dump['Convert_2_to_3']!=1) & (main_dump['Potential_2_to_3']!=1) & (main_dump['Convert_3_to_4']!=1) & (main_dump['Potential_3_to_4']!=1),'Inactive'] = 1
+main_dump['Churned'] = 0
+main_dump.loc[(main_dump['Convert_1_to_2']!=1) & (main_dump['Potential_1_to_2']!=1),'Churned'] = 1
+component_1 = main_dump.groupby('WeekCount').agg(
+    Acquired_Customer_Pool=pd.NamedAgg(column='customer_id', aggfunc='nunique'),
+    Second_Order_Completed_Customer_Pool=pd.NamedAgg(column='Convert_1_to_2', aggfunc='sum'),
+    Potential_for_2nd_Order=pd.NamedAgg(column='Potential_1_to_2', aggfunc='sum'),
+    Third_Order_Completed_Customer_Pool=pd.NamedAgg(column='Convert_2_to_3', aggfunc='sum'),
+    Potential_for_3rd_Order=pd.NamedAgg(column='Potential_2_to_3', aggfunc='sum'),
+    Fourth_Order_Completed_Customer_Pool=pd.NamedAgg(column='Convert_3_to_4', aggfunc='sum'),
+    Potential_for_4th_Order=pd.NamedAgg(column='Potential_3_to_4', aggfunc='sum'),
+).reset_index()
+component_1['Churned_Cust_Pool']=component_1['Acquired_Customer_Pool']-component_1['Second_Order_Completed_Customer_Pool']-component_1['Potential_for_2nd_Order']
+component_1['Inactive_Cust_Pool']=component_1['Second_Order_Completed_Customer_Pool']-component_1['Potential_for_3rd_Order'] - component_1['Third_Order_Completed_Customer_Pool'] + component_1['Third_Order_Completed_Customer_Pool'] -component_1['Fourth_Order_Completed_Customer_Pool'] - component_1['Potential_for_4th_Order']
+component_1=component_1.tail(12)
+
+#Lists
+Acquired_List = main_dump[main_dump['orderCount']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Acquired_List=pd.merge(Acquired_List,t_x_1,on='customer_id',how='left')
+Acquired_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Acquired_List.drop(columns='TrxnRank', inplace=True)
+Acquired_List=Acquired_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Acquired_List.to_csv('Acquired_List.csv')
+
+Second_Order_Completed_User_List = main_dump[main_dump['Convert_1_to_2']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Second_Order_Completed_User_List=pd.merge(Second_Order_Completed_User_List,t_x_1,on='customer_id',how='left')
+Second_Order_Completed_User_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Second_Order_Completed_User_List.drop(columns='TrxnRank', inplace=True)
+Second_Order_Completed_User_List=Second_Order_Completed_User_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Second_Order_Completed_User_List.to_csv('Second_Order_Completed_User_List.csv')
+
+Third_Order_Completed_User_List = main_dump[main_dump['Convert_2_to_3']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Third_Order_Completed_User_List=pd.merge(Third_Order_Completed_User_List,t_x_2,on='customer_id',how='left')
+Third_Order_Completed_User_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Third_Order_Completed_User_List.drop(columns='TrxnRank', inplace=True)
+Third_Order_Completed_User_List=Third_Order_Completed_User_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Third_Order_Completed_User_List.to_csv('Third_Order_Completed_User_List.csv')
+
+Fourth_Order_Completed_User_List = main_dump[main_dump['Convert_3_to_4']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Fourth_Order_Completed_User_List=pd.merge(Fourth_Order_Completed_User_List,t_x_3,on='customer_id',how='left')
+Fourth_Order_Completed_User_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Fourth_Order_Completed_User_List.drop(columns='TrxnRank', inplace=True)
+Fourth_Order_Completed_User_List=Fourth_Order_Completed_User_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Fourth_Order_Completed_User_List.to_csv('Fourth_Order_Completed_User_List.csv')
+
+Potential_for_2nd_Order_List = main_dump[main_dump['Potential_1_to_2']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Potential_for_2nd_Order_List=pd.merge(Potential_for_2nd_Order_List,t_x_1,on='customer_id',how='left')
+Potential_for_2nd_Order_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Potential_for_2nd_Order_List.drop(columns='TrxnRank', inplace=True)
+Potential_for_2nd_Order_List=Potential_for_2nd_Order_List.rename(columns= {'FirstDate' : 'Last_Order_Date','customer_id':'Customer_ID'})
+Potential_for_2nd_Order_List['Next_Potential_Order']='2nd'
+# Potential_for_2nd_Order_List.to_csv('Potential_for_2nd_Order_List.csv')
+
+Potential_for_3rd_Order_List = main_dump[main_dump['Potential_2_to_3']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Potential_for_3rd_Order_List=pd.merge(Potential_for_3rd_Order_List,t_x_2,on='customer_id',how='left')
+Potential_for_3rd_Order_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Potential_for_3rd_Order_List.drop(columns='TrxnRank', inplace=True)
+Potential_for_3rd_Order_List=Potential_for_3rd_Order_List.rename(columns= {'FirstDate' : 'Last_Order_Date','customer_id':'Customer_ID'})
+Potential_for_3rd_Order_List['Next_Potential_Order']='3rd'
+# Potential_for_3rd_Order_List.to_csv('Potential_for_3rd_Order_List.csv')
+
+Potential_for_4th_Order_List = main_dump[main_dump['Potential_3_to_4']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Potential_for_4th_Order_List=pd.merge(Potential_for_4th_Order_List,t_x_3,on='customer_id',how='left')
+Potential_for_4th_Order_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Potential_for_4th_Order_List.drop(columns='TrxnRank', inplace=True)
+Potential_for_4th_Order_List=Potential_for_4th_Order_List.rename(columns= {'FirstDate' : 'Last_Order_Date','customer_id':'Customer_ID'})
+Potential_for_4th_Order_List['Next_Potential_Order']='4th'
+# Potential_for_4th_Order_List.to_csv('Potential_for_4th_Order_List.csv')
+
+Churned_Cust_List = main_dump[main_dump['Churned']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Churned_Cust_List=pd.merge(Churned_Cust_List,t_x_1,on='customer_id',how='left')
+Churned_Cust_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Churned_Cust_List.drop(columns='TrxnRank', inplace=True)
+Churned_Cust_List=Churned_Cust_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Churned_Cust_List.to_csv('Churned_Cust_List.csv')
+
+Inactive_Cust_List = main_dump[main_dump['Inactive']==1][['customer_id','FirstDate','List_of_Pincodes']]
+Inactive_Cust_List=pd.merge(Inactive_Cust_List,t_x,on='customer_id',how='left')
+Inactive_Cust_List.drop(columns='TrxnRank',inplace=True)
+Inactive_Cust_List.drop_duplicates(subset=['customer_id'], keep='first', inplace=True, ignore_index=True)
+Inactive_Cust_List=Inactive_Cust_List.rename(columns= {'FirstDate' : 'Date','customer_id':'Customer_ID'})
+# Inactive_Cust_List.to_csv('Inactive_Cust_List.csv')
+
+Final_Potential_List=pd.concat([Potential_for_2nd_Order_List,Potential_for_3rd_Order_List,Potential_for_4th_Order_List], ignore_index=True)
+hhh=hhh.rename(columns={'user_id':'Customer_ID','accepts_marketing':'Accepts_Marketing','email_marketing_consent_state':'Email_Marketing_Consent_State','sms_marketing_consent_state':'SMS_Marketing_Consent_State','phone_number':'Phone_Number'})
+hhh['Accepts_Marketing']=hhh['Accepts_Marketing'].apply(lambda x: 'Yes' if x==True else 'No')
+
+query_10='''SELECT created_at as created, id as order_iD, total_price as order_amount, customer_id from orders WHERE
+cancelled_at is NULL;
+'''
+e=pd.read_sql(query_10,conn)
+
+e=e.rename(columns={'customer_id':'Customer_ID'})
+
+# e=e[e['created']>='2023/01/01']
+# e=e[e['created']<='2023/12/31']
+
+e = e.dropna()
+
+e['WeekCount']=e['created'].dt.strftime('%Y-w%U')
+
+e=e.sort_values('created')
+WeekList=e['WeekCount'].unique()
+
+#change
+e["New"] = 0
+e['TrxnRank'] = e.groupby('Customer_ID')['created'].rank(method='first')
+e.loc[e['TrxnRank']==1,'New'] = 1
+
+e['OrderDate']=e['created'].dt.date
+e['OrderDate']=pd.to_datetime(e['OrderDate'])
+e['DeltaDaysinOrders']=(e.groupby('Customer_ID').OrderDate.shift() - e.OrderDate).dt.days.abs()
+e['DeltaOrderValues']=(e.groupby('Customer_ID').order_amount.shift() - e.order_amount)
+
+x1=e.groupby('Customer_ID').agg(
+          LastDate=pd.NamedAgg(column='OrderDate', aggfunc= lambda x: x.nlargest(1).min()),
+          FirstDate=pd.NamedAgg(column='OrderDate', aggfunc='min'),
+          Frequency=pd.NamedAgg(column='order_id', aggfunc='nunique'),
+          AOV=pd.NamedAgg(column='order_amount', aggfunc='mean'),
+          OrderValue=pd.NamedAgg(column='order_amount', aggfunc='sum'),#change
+          MeanDaysDelta=pd.NamedAgg(column='DeltaDaysinOrders', aggfunc='mean'),
+          MeanOVDelta=pd.NamedAgg(column='DeltaOrderValues', aggfunc='mean'),
+          TotalTransactions=pd.NamedAgg(column='order_id', aggfunc='nunique'),
+          New=pd.NamedAgg(column='New',aggfunc='mean')#change
+      ).reset_index()
+globalmaxdate=e['OrderDate'].max()
+x1['Recency']=globalmaxdate-x1['LastDate']
+x1['Recency']=x1['Recency'].dt.days.abs()
+x1['ActivatedQuater']=x1['FirstDate'].dt.to_period('Q')
+x1['MaturityAge']=np.nan
+x1.loc[x1['Frequency']>1,"MaturityAge"]=(x1['LastDate']-x1['FirstDate']).dt.days.abs()
+x1['MeanDaysDelta']=x1['MeanDaysDelta'].fillna(0)
+x1['MeanOVDelta']=x1['MeanOVDelta'].fillna(0)
+
+r_labels, f_labels,AOV_labels, m_labels,DelAOV_labels = range(4, 0, -1), range(1,5), range(1,5),range(1,5),range(1,5)
+x1['r_score'] = x1['Recency'].transform(lambda x: pd.qcut(x.rank(method='first'), q = [0, 0.25, 0.5, 0.75, 1], labels = r_labels)).astype('int64')
+x1['f2d_score'] = x1['Frequency'].transform(lambda x: pd.qcut(x.rank(method='first'), q = [0, 0.25, 0.5, 0.75, 1], labels = f_labels)).astype('int64')
+x1['AOV_score'] = x1['AOV'].transform(lambda x: pd.qcut(x.rank(method='first'), q = [0, 0.25, 0.5, 0.75, 1], labels = AOV_labels)).astype('int64')
+x1['m_score']=0
+x1.loc[x1['MaturityAge'].notnull(),'m_score']= x1.loc[x1['MaturityAge'].notnull()]['MaturityAge'].transform(lambda x: pd.qcut(x.rank(method='first'), q = [0, 0.25, 0.5, 0.75, 1], labels = m_labels)).astype('int64')
+x1['DelAOV'] = x1['MeanOVDelta'].transform(lambda x: pd.qcut(x.rank(method='first'), q = [0, 0.25, 0.5, 0.75, 1], labels = DelAOV_labels)).astype('int64')
+x1['SumScore'] = x1['r_score'] + x1['f2d_score'] + x1['m_score'] + x1['AOV_score']+ x1['DelAOV']
+
+def CohortLables_3(df):
+    if ((df['Frequency']==1) & (df['r_score']>2)):
+        return "New"
+    elif ((df['Frequency'] == 1) & (df['r_score'] <= 2)):
+        return 'Churned'
+    elif ((df['Frequency'] > 1) & (df['m_score'] < 3) & (df['r_score'] >2)):
+        return 'Recent & Loyal'
+    elif ((df['Frequency'] > 1) & (df['m_score'] >=3) & (df['r_score'] > 2)):
+        return 'Champion'
+    else:
+        return 'Repeat Churned'
+x1['Customer_Segment'] = x1.apply(CohortLables_3, axis=1)
+
+Final_Potential_List=pd.merge(Final_Potential_List,x1[['Customer_ID','Customer_Segment']],on='Customer_ID',how='left')
+Final_Potential_List=pd.merge(Final_Potential_List, hhh, on ='Customer_ID', how='left')
+Final_Potential_List=Final_Potential_List.rename(columns={'accepts_marketing':'Accepts_Marketing'})
+Final_Potential_List=Final_Potential_List[['Customer_ID','Customer_Name','Customer_Segment','Next_Potential_Order','Accepts_Marketing','Email_Marketing_Consent_State','SMS_Marketing_Consent_State','Last_Order_Date','Phone_Number','Customer email ID','List_of_Pincodes','City']]
+Final_Potential_List['Last_Order_Date']=pd.to_datetime(Final_Potential_List['Last_Order_Date']).dt.date
+print(Final_Potential_List)
